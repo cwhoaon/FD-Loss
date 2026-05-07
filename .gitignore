@@ -44,3 +44,5 @@ dist/
 !.gitkeep
 !checkpoints/**/.gitkeep
 !data/**/.gitkeep
+penv/
+datasets/

@@ -11,7 +11,7 @@ set -euo pipefail
 : "${MASTER_PORT:=29500}"
 : "${GPUS_PER_NODE:=8}"
 : "${GLOBAL_BSZ:=1024}"
-: "${ENABLE_WANDB:=0}"
+: "${ENABLE_WANDB:=1}"
 
 TOTAL_GPUS=$(( NNODES * GPUS_PER_NODE ))
 BATCH_SIZE=$(( GLOBAL_BSZ / TOTAL_GPUS ))
