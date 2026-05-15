@@ -5,16 +5,16 @@ set -euo pipefail
 
 : "${DATA_ROOT:=./datasets/ImageNet}"
 : "${CKPT_ROOT:=./checkpoints/base}"
-: "${CKPT_PATH:=./checkpoints/trained/checkpoint-80.pth}"
+: "${CKPT_PATH:=}"
 : "${NNODES:=1}"
 : "${NODE_RANK:=0}"
 : "${MASTER_ADDR:=127.0.0.1}"
 : "${MASTER_PORT:=29500}"
 : "${GPUS_PER_NODE:=8}"
-: "${GLOBAL_BSZ:=1024}"
+: "${GLOBAL_BSZ:=512}"
 : "${ENABLE_WANDB:=1}"
 : "${WANDB_SAMPLE_EVERY:=2000}"
-: "${FD_GAN_LOSS_WEIGHT:=0.1}"
+: "${FD_GAN_LOSS_WEIGHT:=0.2}"
 : "${FD_GAN_DISC_LR:=2e-4}"
 : "${FD_GAN_BETA1:=0.0}"
 : "${FD_GAN_BETA2:=0.99}"
@@ -23,8 +23,8 @@ set -euo pipefail
 : "${FD_GAN_HIDDEN_DIM:=512}"
 : "${FD_GAN_REAL_BATCH_SIZE:=64}"
 : "${FD_GAN_D_UPDATES:=1}"
-: "${FD_GAN_DISC_START_STEP:=0}"
-: "${FD_GAN_GEN_START_STEP:=0}"
+: "${FD_GAN_DISC_START_STEP:=2000}"
+: "${FD_GAN_GEN_START_STEP:=4000}"
 
 mkdir -p .cache/torchinductor .cache/triton .cache/tmp
 
@@ -89,11 +89,12 @@ run_one() {
         --epochs 50 --steps_per_epoch 1250 --warmup_epochs 5 \
         --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
         --fd_eigvalsh --fd_ema_beta 0.999 \
-        --auto_resume "${GAN_ARGS[@]}" "$WANDB_FLAG" \
+        --compile \
+        "${GAN_ARGS[@]}" "$WANDB_FLAG" \
         "$@"
 }
 
-run_one "JiT-fd-sim-gan${FD_GAN_LOSS_WEIGHT}-${FD_GAN_HEAD_TYPE}-d${FD_GAN_DISC_START_STEP}-g${FD_GAN_GEN_START_STEP}-ep80" \
+run_one "JiT-fd-sim-gan${FD_GAN_LOSS_WEIGHT}" \
     --fd_repr_models "$SIGLIP" "$MAE" inception \
     --fd_repr_pool_types cls cls cls \
     --fd_target_sizes 224 224 256
