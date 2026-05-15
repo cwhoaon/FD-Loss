@@ -7,11 +7,14 @@ import time
 
 import torch
 import torch.distributed
+import torch.nn.functional as F
 
 from utils.builders import create_generation_model, create_tokenizer
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
-from utils.distributed_util import all_reduce_mean, preempt_requested, register_preempt_handler
-from utils.eval_util import evaluate_all_emas
+from utils.distributed_util import (
+    all_reduce_mean, broadcast_module_params, preempt_requested, register_preempt_handler,
+)
+from utils.eval_util import evaluate_all_emas, log_wandb_sample_grids
 from utils.grad_util import get_grad_norm
 from utils.logging_util import MetricLogger, SmoothedValue
 from utils.optimizer_util import create_optimizer
@@ -23,8 +26,9 @@ from frechet_distance.losses import (
     load_mu_and_sigma_reference, precompute_sigma_ref_sqrt,
 )
 from frechet_distance.repr_models import load_repr_model, model_short_name
+from frechet_distance.gan_heads import create_gan_head
 from frechet_distance.judges import (
-    extract_judge_features,
+    extract_judge_features, extract_judge_gan_features, resolve_gan_feature_kind,
     resolve_per_model_args, save_fd_queue_states, load_fd_queue_states,
     fill_all_queues, run_sanity_check,
 )
@@ -48,7 +52,290 @@ logger = logging.getLogger("FD_loss")
 # FD train step
 # ---------------------------------------------------------------------------
 
-def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None):
+def build_flow_matching_dataloader(args, batch_size=None, log_prefix="[FD+FM]"):
+    import torchvision.datasets as datasets
+    import torchvision.transforms as transforms
+    from torch.utils.data import DataLoader, DistributedSampler
+
+    from utils.data_util import center_crop_arr
+
+    train_dir = os.path.join(args.data_path, "train")
+    if not os.path.isdir(train_dir):
+        train_dir = args.data_path
+
+    transform = transforms.Compose([
+        transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.PILToTensor(),
+    ])
+    dataset = datasets.ImageFolder(train_dir, transform=transform)
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=args.world_size,
+        rank=args.rank,
+        shuffle=True,
+        drop_last=True,
+    ) if args.world_size > 1 else None
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size or args.fd_flow_matching_batch_size or args.batch_size,
+        sampler=sampler,
+        shuffle=(sampler is None),
+        num_workers=args.num_workers,
+        pin_memory=args.pin_mem,
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    logger.info(
+        f"{log_prefix} Using ImageFolder real samples from {train_dir}; "
+        f"num_images={len(dataset)}, batch_size={loader.batch_size}"
+    )
+    return loader, sampler
+
+
+def infinite_flow_matching_batches(loader, sampler):
+    epoch = 0
+    while True:
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+        for batch in loader:
+            yield batch
+        epoch += 1
+
+
+def compute_one_step_flow_matching_loss(model, x, y, args):
+    """One-step t=0 flow-matching loss on random dataset/noise couplings.
+
+    Shapes:
+        x:                [B, C, H, W], real images in model space [-1, 1]
+        y:                [B], integer class labels
+        noise:            [B, C, H, W], sampled independently from N(0, noise_scale^2 I)
+        target:           [B, C, H, W], x - noise for one-step noise -> data regression
+        pred:             [B, C, H, W], predicted displacement field
+        pred_x0:          [B, C, H, W], one-step predicted image f(epsilon, 0)
+        per_sample_mse:   [B], mean squared FM regression loss per sample
+        sample_weights:   [B], optional multiplicative FM loss weights
+    """
+    B = x.shape[0]
+    device = x.device
+    dtype = x.dtype
+    noise_scale = getattr(model, "noise_scale", args.noise_scale)
+    noise = torch.randn_like(x) * noise_scale
+    target = x - noise
+
+    if model.training and hasattr(model, "drop_labels"):
+        y = model.drop_labels(y)
+    elif model.training and hasattr(model, "label_drop_prob") and hasattr(model, "num_classes"):
+        drop = torch.rand(B, device=device) < model.label_drop_prob
+        y = torch.where(drop, torch.full_like(y, model.num_classes), y)
+
+    # Loss convention: official flow time s=0 is noise and target dx/ds = x - noise.
+    # pMF/iMF samplers store the opposite field u because they update z <- z - h * u.
+    if hasattr(model, "u_fn"):
+        t = torch.ones(B, device=device)
+        h = torch.ones(B, device=device)
+        omega = torch.ones(B, device=device)
+        t_min = torch.zeros(B, device=device)
+        t_max = torch.ones(B, device=device)
+        pred = -model.u_fn(noise, t, h, omega, t_min, t_max, y)[0]
+    elif hasattr(model, "net") and hasattr(model, "_backbone_t"):
+        t = torch.ones(B, device=device)
+        x_pred = model.net(noise, model._backbone_t(t), y)
+        pred = x_pred - noise
+    else:
+        raise NotImplementedError(
+            f"{type(model).__name__} does not expose a supported t=0 FM prediction path"
+        )
+
+    if pred.shape != target.shape:
+        raise RuntimeError(
+            f"FM prediction shape {tuple(pred.shape)} does not match target {tuple(target.shape)}"
+        )
+
+    pred_x0 = noise + pred
+    residual = pred - target
+    residual_flat = residual.float().reshape(B, -1)
+    per_sample_mse = residual_flat.square().mean(dim=1)
+
+    metrics = {
+        "fm_t0_unweighted": float(per_sample_mse.mean().detach()),
+    }
+
+    if args.fd_flow_matching_sample_weight_mode == "none":
+        sample_weights = torch.ones(B, device=device, dtype=per_sample_mse.dtype)
+    elif args.fd_flow_matching_sample_weight_mode == "pred_x0_l2_exp":
+        pred_error = pred_x0 - x
+        pred_error_flat = pred_error.float().reshape(B, -1)
+        pred_error_l2 = torch.linalg.vector_norm(pred_error_flat, ord=2, dim=1)
+        temperature = args.fd_flow_matching_sample_weight_temperature
+        if temperature <= 0.0:
+            raise ValueError("--fd_flow_matching_sample_weight_temperature must be > 0")
+        log_weights = (-pred_error_l2 / temperature).clamp(min=-80.0, max=0.0)
+        sample_weights = torch.exp(log_weights).detach()
+        metrics["fm_t0_pred_x0_l2"] = float(pred_error_l2.mean().detach())
+        metrics["fm_t0_weight_mean"] = float(sample_weights.mean().detach())
+    else:
+        raise ValueError(
+            f"Unsupported --fd_flow_matching_sample_weight_mode={args.fd_flow_matching_sample_weight_mode}"
+        )
+
+    weighted_per_sample_loss = per_sample_mse * sample_weights
+    return weighted_per_sample_loss.mean(), metrics
+
+
+def set_requires_grad(module, requires_grad):
+    for p in module.parameters():
+        p.requires_grad_(requires_grad)
+
+
+def gan_heads_state_dict(judges):
+    return {
+        judge["key"]: judge["gan_head"].state_dict()
+        for judge in judges
+        if "gan_head" in judge
+    }
+
+
+def load_gan_heads_state_dict(judges, state):
+    loaded = 0
+    for judge in judges:
+        if "gan_head" not in judge:
+            continue
+        if judge["key"] in state:
+            judge["gan_head"].load_state_dict(state[judge["key"]])
+            loaded += 1
+            logger.info(f"[FD+GAN] Restored discriminator head for '{judge['name']}'")
+        else:
+            logger.warning(f"[FD+GAN] No discriminator head state for '{judge['name']}'")
+    return loaded
+
+
+def create_gan_optimizer(args, judges):
+    params = []
+    for judge in judges:
+        head = judge.get("gan_head")
+        if head is not None:
+            params.extend(p for p in head.parameters() if p.requires_grad)
+    if not params:
+        return None
+    opt = torch.optim.AdamW(
+        params,
+        lr=args.fd_gan_disc_lr,
+        betas=(args.fd_gan_beta1, args.fd_gan_beta2),
+        weight_decay=args.fd_gan_weight_decay,
+    )
+    logger.info(f"[FD+GAN] discriminator optimizer = {opt}")
+    return opt
+
+
+def sync_gan_heads(judges, src=0):
+    for judge in judges:
+        head = judge.get("gan_head")
+        if head is not None:
+            broadcast_module_params(head, src=src)
+
+
+def compute_gan_losses(judges, fake_images, real_images, args, gan_optimizer=None):
+    """Run optional D update and return generator GAN loss.
+
+    Shapes:
+        fake_images: [B, 3, H, W] in [0, 1], gradient path to generator.
+        real_images: [B, 3, H, W] in [0, 1].
+        discriminator logits: [B].
+    """
+    if args.fd_gan_loss_weight <= 0.0:
+        return fake_images.new_tensor(0.0), {}
+
+    gan_judges = [j for j in judges if "gan_head" in j]
+    if not gan_judges:
+        return fake_images.new_tensor(0.0), {}
+
+    current_step = getattr(args, "current_step", 0)
+    disc_active = current_step >= args.fd_gan_disc_start_step
+    gen_active = current_step >= args.fd_gan_gen_start_step
+    weight_sum = sum(float(j["weight"]) for j in gan_judges)
+    if weight_sum <= 0.0:
+        weight_sum = 1.0
+
+    metrics = {
+        "gan_d_active": float(disc_active),
+        "gan_g_active": float(gen_active),
+    }
+
+    if gan_optimizer is not None and disc_active:
+        d_metric_accum = {}
+        for _ in range(args.fd_gan_d_updates):
+            gan_optimizer.zero_grad(set_to_none=True)
+            d_total = fake_images.new_tensor(0.0)
+            step_metrics = {}
+            for judge in gan_judges:
+                head = judge["gan_head"]
+                metric_name = judge.get("metric_name", judge["name"])
+                set_requires_grad(head, True)
+                head.train()
+                with torch.no_grad():
+                    feat_real = extract_judge_gan_features(
+                        judge, real_images, judge["gan_feature_kind"],
+                    )
+                    feat_fake = extract_judge_gan_features(
+                        judge, fake_images.detach(), judge["gan_feature_kind"],
+                    )
+                real_logits = head(feat_real)
+                fake_logits = head(feat_fake)
+                if real_logits.ndim != 1 or fake_logits.ndim != 1:
+                    raise RuntimeError(
+                        f"GAN logits must be [B], got real={tuple(real_logits.shape)} "
+                        f"fake={tuple(fake_logits.shape)}"
+                    )
+                d_loss = F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean()
+                d_total = d_total + (float(judge["weight"]) / weight_sum) * d_loss
+                step_metrics[f"gan_d_loss_{metric_name}"] = float(d_loss.detach())
+                step_metrics[f"gan_real_logit_{metric_name}"] = float(real_logits.mean().detach())
+                step_metrics[f"gan_fake_logit_{metric_name}"] = float(fake_logits.mean().detach())
+                step_metrics[f"gan_r1_{metric_name}"] = 0.0
+
+            d_total.backward()
+            if torch.distributed.is_initialized():
+                for judge in gan_judges:
+                    for p in judge["gan_head"].parameters():
+                        if p.grad is not None:
+                            torch.distributed.all_reduce(p.grad, op=torch.distributed.ReduceOp.AVG)
+            gan_optimizer.step()
+            step_metrics["gan_d_loss"] = float(d_total.detach())
+            for key, value in step_metrics.items():
+                d_metric_accum[key] = d_metric_accum.get(key, 0.0) + value
+        for key, value in d_metric_accum.items():
+            metrics[key] = value / args.fd_gan_d_updates
+
+    if not gen_active:
+        return fake_images.new_tensor(0.0), metrics
+
+    g_total = fake_images.new_tensor(0.0)
+    for judge in gan_judges:
+        head = judge["gan_head"]
+        metric_name = judge.get("metric_name", judge["name"])
+        was_training = head.training
+        set_requires_grad(head, False)
+        head.eval()
+        feat_fake = extract_judge_gan_features(judge, fake_images, judge["gan_feature_kind"])
+        fake_logits = head(feat_fake)
+        if was_training:
+            head.train()
+        if fake_logits.ndim != 1:
+            raise RuntimeError(f"GAN generator logits must be [B], got {tuple(fake_logits.shape)}")
+        g_loss = -fake_logits.mean()
+        g_total = g_total + (float(judge["weight"]) / weight_sum) * g_loss
+        metrics[f"gan_g_loss_{metric_name}"] = float(g_loss.detach())
+        metrics[f"gan_g_loss_norm_{metric_name}"] = float(g_loss.detach())
+    for judge in gan_judges:
+        set_requires_grad(judge["gan_head"], True)
+
+    metrics["gan_g_loss"] = float(g_total.detach())
+    return args.fd_gan_loss_weight * g_total, metrics
+
+
+def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
+                      real_image_iter=None, gan_optimizer=None):
     fid_norm_eps = args.fd_fid_norm_eps
     batch_size = args.batch_size
     num_classes = args.num_classes
@@ -65,6 +352,12 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
 
         loss = torch.tensor(0.0, device="cuda")
         loss_dict = {}
+        x_real_01 = None
+        y_real = None
+        if real_image_iter is not None:
+            x_real_u8, y_real = next(real_image_iter)
+            x_real_01 = x_real_u8.cuda(non_blocking=True).to(torch.float32).div_(255.0)
+            y_real = y_real.cuda(non_blocking=True)
 
         all_new_feats = []
         for judge in judges:
@@ -74,6 +367,7 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
 
         for i, judge in enumerate(judges):
             new_feats = all_new_feats[i]
+            metric_name = judge.get("metric_name", judge["name"])
 
             _ns_kwargs = dict(sigma_ref_sqrt=judge.get("sigma_ref_sqrt"))
             if judge["queue"].online_accum or judge["queue"].ema_stats:
@@ -88,7 +382,21 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
                                                     **_ns_kwargs)
             fid_loss = fid / (fid.detach() + fid_norm_eps)
             loss = loss + judge["weight"] * fid_loss
-            loss_dict[f"fid_{judge['name']}"] = float(fid.detach())
+            loss_dict[f"fid_{metric_name}"] = float(fid.detach())
+
+        if args.fd_gan_loss_weight > 0.0:
+            gan_loss, gan_metrics = compute_gan_losses(
+                judges, sampled, x_real_01, args, gan_optimizer=gan_optimizer,
+            )
+            loss = loss + gan_loss
+            loss_dict.update(gan_metrics)
+
+        if args.fd_flow_matching_loss_weight > 0.0:
+            x_real_fm = x_real_01.mul(2.0).sub(1.0)
+            fm_loss, fm_metrics = compute_one_step_flow_matching_loss(model_wo_ddp, x_real_fm, y_real, args)
+            loss = loss + args.fd_flow_matching_loss_weight * fm_loss
+            loss_dict["fm_t0"] = float(fm_loss.detach())
+            loss_dict.update(fm_metrics)
 
         loss.backward(create_graph=False)
 
@@ -102,7 +410,9 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
 
         return loss, loss_dict
 
-    if args.compile:
+    if args.compile and real_image_iter is not None:
+        logger.warning("[Compilation] --compile is disabled because the train step reads a DataLoader")
+    elif args.compile:
         from utils.runtime_util import _warmup
         logger.info("[Compilation] Compiling fd_train_step ...")
         t0 = time.perf_counter()
@@ -128,7 +438,7 @@ def train_and_evaluate(args):
     model_wo_ddp = model
 
     extra = ckpt_resume(args, model_wo_ddp, optimizer, ema_model,
-                        extra_keys=["fd_queue_states"])
+                        extra_keys=["fd_queue_states", "gan_head_states", "gan_optimizer"])
 
     rng = RNGStateManager()
     rng.save()
@@ -145,10 +455,10 @@ def train_and_evaluate(args):
     resolve_per_model_args(args)
 
     judges = []
-    for name, stats_path, weight, pool_type, ts in zip(
+    for idx, (name, stats_path, weight, pool_type, ts) in enumerate(zip(
         args.fd_repr_models, args.fd_repr_stats_paths,
         args.fd_repr_weights, args.fd_repr_pool_types, args.fd_target_sizes,
-    ):
+    )):
         repr_model, feat_dim, _, _ = load_repr_model(name, target_size=ts)
         mu_ref, sigma_ref = load_mu_and_sigma_reference(stats_path, pool_type=pool_type)
         queue = FeatureQueue(size=args.queue_size, feat_dim=feat_dim,
@@ -159,16 +469,33 @@ def train_and_evaluate(args):
         if args.fd_eigvalsh:
             sigma_ref_sqrt = precompute_sigma_ref_sqrt(sigma_ref)
         judges.append({
-            "name": short, "model": repr_model,
+            "key": f"{idx}_{name.replace('.', '_')}",
+            "name": short, "metric_name": f"{idx}_{short}", "model": repr_model,
             "feat_dim": feat_dim,
             "pool_type": pool_type,
             "mu_ref": mu_ref, "sigma_ref": sigma_ref,
             "sigma_ref_sqrt": sigma_ref_sqrt,
             "queue": queue, "weight": weight,
         })
+        judge = judges[-1]
+        if args.fd_gan_loss_weight > 0.0:
+            feature_kind = resolve_gan_feature_kind(judge, args.fd_gan_head_type)
+            num_prefix_tokens = getattr(repr_model, "num_prefix_tokens", 0)
+            judge["gan_feature_kind"] = feature_kind
+            judge["gan_head"] = create_gan_head(
+                feature_kind=feature_kind,
+                c_in=feat_dim,
+                c_mid=args.fd_gan_hidden_dim,
+                num_prefix_tokens=num_prefix_tokens,
+            ).cuda()
+            logger.info(
+                f"[FD+GAN] Repr '{judge['metric_name']}': head_type={args.fd_gan_head_type}, "
+                f"feature_kind={feature_kind}, c_in={feat_dim}, c_mid={args.fd_gan_hidden_dim}, "
+                f"num_prefix_tokens={num_prefix_tokens}"
+            )
         eig_mode = "eigvalsh" if args.fd_eigvalsh else "eigvals"
         stats_mode = f"ema(beta={args.fd_ema_beta})" if args.fd_ema_beta > 0 else ("online_accum" if args.fd_online_accum else "snapshot")
-        logger.info(f"[FD] Repr '{short}' ({name}): feat_dim={feat_dim}, "
+        logger.info(f"[FD] Repr '{judge['metric_name']}' ({name}): feat_dim={feat_dim}, "
                      f"weight={weight}, pool={pool_type}, stats={stats_path}, "
                      f"eig_mode={eig_mode}, stats_mode={stats_mode}")
 
@@ -183,12 +510,55 @@ def train_and_evaluate(args):
                     f"({args.queue_size} entries each) ...")
         fill_all_queues(judges, model_wo_ddp, args, tokenizer=tokenizer)
         run_sanity_check(judges, args.queue_size, args=args)
+    if args.fd_gan_loss_weight > 0.0:
+        sync_gan_heads(judges, src=0)
+        logger.info("[FD+GAN] Synchronized discriminator head parameters and buffers from rank 0")
+    gan_optimizer = create_gan_optimizer(args, judges) if args.fd_gan_loss_weight > 0.0 else None
+    if extra is not None and args.fd_gan_loss_weight > 0.0:
+        if "gan_head_states" in extra:
+            load_gan_heads_state_dict(judges, extra["gan_head_states"])
+        if "gan_optimizer" in extra and gan_optimizer is not None:
+            gan_optimizer.load_state_dict(extra["gan_optimizer"])
+            logger.info("[FD+GAN] Restored discriminator optimizer")
     del extra
     torch.distributed.barrier()
 
     model.train()
     args.input_channels = model_wo_ddp.in_channels
     args.input_size = model_wo_ddp.input_size
+
+    real_image_iter = None
+    needs_real_images = args.fd_flow_matching_loss_weight > 0.0 or args.fd_gan_loss_weight > 0.0
+    if needs_real_images:
+        if args.fd_gan_loss_weight > 0.0 and args.fd_gan_d_updates < 1:
+            raise ValueError("--fd_gan_d_updates must be >= 1 when GAN is enabled")
+        if args.fd_gan_loss_weight > 0.0 and args.fd_gan_disc_start_step < 0:
+            raise ValueError("--fd_gan_disc_start_step must be >= 0")
+        if args.fd_gan_loss_weight > 0.0 and args.fd_gan_gen_start_step < 0:
+            raise ValueError("--fd_gan_gen_start_step must be >= 0")
+        if args.fd_gan_loss_weight > 0.0 and args.fd_gan_norm_mode != "none":
+            raise NotImplementedError("--gan_norm_mode currently supports only 'none'")
+        if args.fd_gan_loss_weight > 0.0 and args.fd_gan_r1_gamma != 0.0:
+            raise NotImplementedError("--gan_r1_gamma is exposed for experiments but R1 is not implemented yet")
+        if tokenizer is not None:
+            if args.fd_flow_matching_loss_weight > 0.0:
+                raise NotImplementedError(
+                    "--fd_flow_matching_loss_weight currently supports pixel-space models only; "
+                    "this tokenizer has no training encode path for dataset samples."
+                )
+        if (
+            args.fd_flow_matching_sample_weight_mode != "none"
+            and args.fd_flow_matching_sample_weight_temperature <= 0.0
+        ):
+            raise ValueError(
+                "--fd_flow_matching_sample_weight_temperature must be > 0 "
+                f"when mode is {args.fd_flow_matching_sample_weight_mode}"
+            )
+        real_bsz = args.fd_gan_real_batch_size or args.fd_flow_matching_batch_size or args.batch_size
+        real_loader, real_sampler = build_flow_matching_dataloader(
+            args, batch_size=real_bsz, log_prefix="[FD+REAL]",
+        )
+        real_image_iter = infinite_flow_matching_batches(real_loader, real_sampler)
 
     # -- FD train step closure --
     sampling_args = {
@@ -199,6 +569,7 @@ def train_and_evaluate(args):
     }
     fd_train_step = get_fd_train_step(
         model_wo_ddp, judges, sampling_args, args, tokenizer=tokenizer,
+        real_image_iter=real_image_iter, gan_optimizer=gan_optimizer,
     )
 
     # -- training loop --
@@ -313,6 +684,10 @@ def train_and_evaluate(args):
         def _save(saver=ckpt_saver):
             elapsed = time.time() - session_start + args.last_elapsed_time
             fd_extra = {"fd_queue_states": save_fd_queue_states(judges)} if judges else {}
+            if args.fd_gan_loss_weight > 0.0:
+                fd_extra["gan_head_states"] = gan_heads_state_dict(judges)
+                if gan_optimizer is not None:
+                    fd_extra["gan_optimizer"] = gan_optimizer.state_dict()
             save_checkpoint(args, step, model_wo_ddp, optimizer, ema_model, elapsed,
                             saver=saver, extra=fd_extra)
             torch.distributed.barrier()
@@ -336,6 +711,14 @@ def train_and_evaluate(args):
         # visualization
         if args.vis_every > 0 and args.current_step % args.vis_every == 0:
             visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer)
+            model_wo_ddp.train()
+
+        # fixed 25-class wandb sample grids, independent of metric eval
+        if args.wandb_sample_every > 0 and args.current_step % args.wandb_sample_every == 0:
+            log_wandb_sample_grids(
+                args, model_wo_ddp, ema_model, tokenizer,
+                step=args.current_step, wandb_logger=wandb_logger, cfg=args.cfg,
+            )
             model_wo_ddp.train()
 
         # online evaluation
@@ -495,6 +878,63 @@ def get_args_parser():
     parser.add_argument("--fd_ema_beta", type=float, default=0.0, metavar="BETA",
                         help="EMA decay for FD stats (0=disabled, use queue). "
                              "Implies online_accum. E.g. 0.999 → ~1000-batch window")
+    parser.add_argument("--fd_flow_matching_loss_weight", type=float, default=0.0,
+                        help="add weighted one-step t=0 flow-matching loss on random real/noise couplings")
+    parser.add_argument("--fd_flow_matching_batch_size", type=int, default=None,
+                        help="real-image batch size for the auxiliary one-step flow-matching loss "
+                             "(default: --batch_size)")
+    parser.add_argument("--fd_flow_matching_sample_weight_mode", type=str, default="none",
+                        choices=["none", "pred_x0_l2_exp"],
+                        help="optional per-sample weighting for the auxiliary FM loss; "
+                             "'pred_x0_l2_exp' uses exp(-||f(epsilon,0)-x||_2 / T)")
+    parser.add_argument("--fd_flow_matching_sample_weight_temperature", type=float, default=1.0,
+                        help="temperature T used by --fd_flow_matching_sample_weight_mode=pred_x0_l2_exp")
+    parser.add_argument("--fd_gan_loss_weight", "--gan_loss_weight", dest="fd_gan_loss_weight",
+                        type=float, default=0.0,
+                        help="global weight for representation-space GAN generator loss")
+    parser.add_argument("--fd_gan_disc_lr", "--gan_lr", dest="fd_gan_disc_lr",
+                        type=float, default=2e-4,
+                        help="discriminator-head AdamW learning rate")
+    parser.add_argument("--fd_gan_beta1", "--gan_beta1", dest="fd_gan_beta1",
+                        type=float, default=0.0)
+    parser.add_argument("--fd_gan_beta2", "--gan_beta2", dest="fd_gan_beta2",
+                        type=float, default=0.99)
+    parser.add_argument("--fd_gan_weight_decay", "--gan_weight_decay", dest="fd_gan_weight_decay",
+                        type=float, default=0.0)
+    parser.add_argument("--fd_gan_head_type", "--gan_head_type", dest="fd_gan_head_type",
+                        type=str, default="patch",
+                        choices=["patch", "scalar"],
+                        help="GAN discriminator head: patch uses dense repr features, scalar uses pooled FD features")
+    parser.add_argument("--fd_gan_hidden_dim", "--gan_hidden_dim", dest="fd_gan_hidden_dim",
+                        type=int, default=512,
+                        help="middle channel/hidden width for GAN discriminator heads")
+    parser.add_argument("--fd_gan_real_batch_size", "--gan_real_batch_size", dest="fd_gan_real_batch_size",
+                        type=int, default=None,
+                        help="real-image batch size for GAN D update (default: FM batch size or --batch_size)")
+    parser.add_argument("--fd_gan_d_updates", "--gan_d_updates", dest="fd_gan_d_updates",
+                        type=int, default=1,
+                        help="number of discriminator-head updates per generator update")
+    parser.add_argument("--fd_gan_disc_start_step", "--gan_disc_start_step", dest="fd_gan_disc_start_step",
+                        type=int, default=0,
+                        help="training step at which discriminator-head updates start")
+    parser.add_argument("--fd_gan_gen_start_step", "--gan_gen_start_step", dest="fd_gan_gen_start_step",
+                        type=int, default=0,
+                        help="training step at which generator GAN loss starts contributing to total loss")
+    parser.add_argument("--fd_gan_norm_mode", "--gan_norm_mode", dest="fd_gan_norm_mode",
+                        type=str, default="none", choices=["none"],
+                        help="GAN generator-loss normalization mode; only 'none' is implemented")
+    parser.add_argument("--fd_gan_norm_eps", "--gan_norm_eps", dest="fd_gan_norm_eps",
+                        type=float, default=0.01,
+                        help="reserved GAN norm epsilon for future normalization modes")
+    parser.add_argument("--fd_gan_norm_ema_decay", "--gan_norm_ema_decay", dest="fd_gan_norm_ema_decay",
+                        type=float, default=0.99,
+                        help="reserved GAN norm EMA decay for future normalization modes")
+    parser.add_argument("--fd_gan_r1_gamma", "--gan_r1_gamma", dest="fd_gan_r1_gamma",
+                        type=float, default=0.0,
+                        help="reserved R1 regularization weight; nonzero is not implemented")
+    parser.add_argument("--fd_gan_r1_every", "--gan_r1_every", dest="fd_gan_r1_every",
+                        type=int, default=16,
+                        help="reserved R1 interval for future discriminator regularization")
     # logging & tracking
     parser.add_argument("--output_dir", default="./work_dirs")
     parser.add_argument("--local_eval_dir", type=str, default=None)
@@ -503,6 +943,8 @@ def get_args_parser():
     parser.add_argument("--vis_freq", type=int, default=10)
     parser.add_argument("--val_freq", type=int, default=10)
     parser.add_argument("--save_freq", type=int, default=5)
+    parser.add_argument("--wandb_sample_every", type=int, default=1000,
+                        help="log fixed 25-class 5x5 sample grids to wandb every N training steps")
     parser.add_argument("--vis_only", action="store_true")
     parser.add_argument("--disable_vis", action="store_true")
     parser.add_argument("--last_elapsed_time", type=float, default=0.0)

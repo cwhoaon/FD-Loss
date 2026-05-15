@@ -46,6 +46,46 @@ def extract_judge_features(judge, images):
     return primary
 
 
+def resolve_gan_feature_kind(judge, head_type):
+    """Resolve the feature tensor kind consumed by a GAN discriminator head."""
+    if head_type == "scalar":
+        return "pooled"
+    elif head_type == "patch":
+        model = judge["model"]
+        if hasattr(model, "forward_spatial"):
+            return "cnn_map"
+        if hasattr(model, "forward_dense"):
+            dense_ndim = getattr(model, "gan_dense_ndim", None)
+            if dense_ndim == 4:
+                return "cnn_map"
+            return "vit_tokens"
+        raise ValueError(f"judge {judge['name']} does not expose dense features for patch GAN")
+    raise ValueError(f"unsupported GAN head type '{head_type}' for judge {judge['name']}")
+
+
+def extract_judge_gan_features(judge, images, feature_kind):
+    """Extract representation features for GAN heads.
+
+    Shapes by feature_kind:
+        pooled:     [B, D]
+        vit_tokens: [B, N + P, C]
+        cnn_map:    [B, C, H, W]
+    """
+    if feature_kind == "pooled":
+        return extract_judge_features(judge, images)
+    model = judge["model"]
+    if feature_kind == "cnn_map" and hasattr(model, "forward_spatial"):
+        return model.forward_spatial(images)
+    if feature_kind in ("vit_tokens", "cnn_map") and hasattr(model, "forward_dense"):
+        feats = model.forward_dense(images)
+        if feature_kind == "vit_tokens" and feats.ndim != 3:
+            raise RuntimeError(f"expected ViT tokens [B, N, C], got {tuple(feats.shape)}")
+        if feature_kind == "cnn_map" and feats.ndim != 4:
+            raise RuntimeError(f"expected CNN map [B, C, H, W], got {tuple(feats.shape)}")
+        return feats
+    raise ValueError(f"unsupported GAN feature kind '{feature_kind}' for judge {judge['name']}")
+
+
 def resolve_per_model_args(args):
     """Resolve per-model stats paths, weights, pool types, and target sizes."""
     num = len(args.fd_repr_models)
@@ -83,25 +123,50 @@ def resolve_per_model_args(args):
 
 def save_fd_queue_states(judges):
     """Collect queue state dicts from all judges for checkpointing."""
-    return [{"name": j["name"], "queue": j["queue"].state_dict()} for j in judges]
+    return [
+        {
+            "key": j.get("key", j["name"]),
+            "name": j["name"],
+            "queue": j["queue"].state_dict(),
+        }
+        for j in judges
+    ]
 
 
 def load_fd_queue_states(judges, saved_states):
     """Restore queue states from checkpoint into judges.
 
-    Matches by name; skips any judge whose name is not found in the saved
-    states (e.g. when the set of repr models changed between runs).
+    Matches by stable key when available, with a backward-compatible fallback
+    to unique legacy names.
     """
-    name_to_state = {s["name"]: s["queue"] for s in saved_states}
+    key_to_state = {
+        s["key"]: s["queue"]
+        for s in saved_states
+        if "key" in s
+    }
+    name_counts = {}
+    for s in saved_states:
+        name_counts[s["name"]] = name_counts.get(s["name"], 0) + 1
+    unique_name_to_state = {
+        s["name"]: s["queue"]
+        for s in saved_states
+        if name_counts[s["name"]] == 1
+    }
     loaded = 0
     for judge in judges:
-        if judge["name"] in name_to_state:
-            judge["queue"].load_state_dict(name_to_state[judge["name"]])
+        state = key_to_state.get(judge.get("key"))
+        if state is None:
+            state = unique_name_to_state.get(judge["name"])
+        if state is not None:
+            judge["queue"].load_state_dict(state)
             judge["queue"].cuda()
             loaded += 1
-            logger.info(f"[FD] Restored queue state for '{judge['name']}'")
+            logger.info(f"[FD] Restored queue state for '{judge.get('metric_name', judge['name'])}'")
         else:
-            logger.warning(f"[FD] No saved queue state for '{judge['name']}', will need queue fill")
+            logger.warning(
+                f"[FD] No saved queue state for '{judge.get('metric_name', judge['name'])}', "
+                "will need queue fill"
+            )
     return loaded == len(judges)
 
 

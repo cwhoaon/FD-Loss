@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Table 2: JiT-L multi-step to one-step repurposing.
+# JiT-B FD-loss fine-tuning with auxiliary representation-space GAN loss.
 
 set -euo pipefail
 
@@ -14,15 +14,23 @@ set -euo pipefail
 : "${GLOBAL_BSZ:=1024}"
 : "${ENABLE_WANDB:=1}"
 : "${WANDB_SAMPLE_EVERY:=2000}"
-
+: "${FD_GAN_LOSS_WEIGHT:=0.1}"
+: "${FD_GAN_DISC_LR:=2e-4}"
+: "${FD_GAN_BETA1:=0.0}"
+: "${FD_GAN_BETA2:=0.99}"
+: "${FD_GAN_WEIGHT_DECAY:=0.0}"
+: "${FD_GAN_HEAD_TYPE:=patch}"
+: "${FD_GAN_HIDDEN_DIM:=512}"
+: "${FD_GAN_REAL_BATCH_SIZE:=64}"
+: "${FD_GAN_D_UPDATES:=1}"
+: "${FD_GAN_DISC_START_STEP:=0}"
+: "${FD_GAN_GEN_START_STEP:=0}"
 
 mkdir -p .cache/torchinductor .cache/triton .cache/tmp
 
 export TMPDIR="$PWD/.cache/tmp"
 export TORCHINDUCTOR_CACHE_DIR="$PWD/.cache/torchinductor"
 export TRITON_CACHE_DIR="$PWD/.cache/triton"
-
-
 
 TOTAL_GPUS=$(( NNODES * GPUS_PER_NODE ))
 BATCH_SIZE=$(( GLOBAL_BSZ / TOTAL_GPUS ))
@@ -34,6 +42,22 @@ fi
 LOAD_FROM="${CKPT_ROOT}/JiT-B.pth"
 if [ -n "$CKPT_PATH" ]; then
     LOAD_FROM="$CKPT_PATH"
+fi
+
+GAN_ARGS=(
+    --fd_gan_loss_weight "$FD_GAN_LOSS_WEIGHT"
+    --fd_gan_disc_lr "$FD_GAN_DISC_LR"
+    --fd_gan_beta1 "$FD_GAN_BETA1"
+    --fd_gan_beta2 "$FD_GAN_BETA2"
+    --fd_gan_weight_decay "$FD_GAN_WEIGHT_DECAY"
+    --fd_gan_head_type "$FD_GAN_HEAD_TYPE"
+    --fd_gan_hidden_dim "$FD_GAN_HIDDEN_DIM"
+    --fd_gan_d_updates "$FD_GAN_D_UPDATES"
+    --fd_gan_disc_start_step "$FD_GAN_DISC_START_STEP"
+    --fd_gan_gen_start_step "$FD_GAN_GEN_START_STEP"
+)
+if [ -n "$FD_GAN_REAL_BATCH_SIZE" ]; then
+    GAN_ARGS+=(--fd_gan_real_batch_size "$FD_GAN_REAL_BATCH_SIZE")
 fi
 
 MAE="vit_large_patch16_224.mae"
@@ -65,11 +89,11 @@ run_one() {
         --epochs 50 --steps_per_epoch 1250 --warmup_epochs 5 \
         --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
         --fd_eigvalsh --fd_ema_beta 0.999 \
-        --compile --auto_resume "$WANDB_FLAG" \
+        --auto_resume "${GAN_ARGS[@]}" "$WANDB_FLAG" \
         "$@"
 }
 
-run_one JiT-fd-sim-ep80 \
+run_one "JiT-fd-sim-gan${FD_GAN_LOSS_WEIGHT}-${FD_GAN_HEAD_TYPE}-d${FD_GAN_DISC_START_STEP}-g${FD_GAN_GEN_START_STEP}-ep80" \
     --fd_repr_models "$SIGLIP" "$MAE" inception \
     --fd_repr_pool_types cls cls cls \
     --fd_target_sizes 224 224 256

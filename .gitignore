@@ -46,3 +46,5 @@ dist/
 !data/**/.gitkeep
 penv/
 datasets/
+.cache/
+exp_desc/

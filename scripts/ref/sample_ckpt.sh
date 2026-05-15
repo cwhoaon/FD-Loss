@@ -66,4 +66,6 @@ torchrun --nproc_per_node="$GPUS_PER_NODE" --master_port="$MASTER_PORT" \
     --load_from "$CKPT_PATH" \
     --output_dir "$RESULT_ROOT" \
     --project "$PROJECT" \
-    --exp_name "$EXP_NAME" 
+    --exp_name "$EXP_NAME" \
+    --save_eval_images --keep_eval_folder --gen_only
+

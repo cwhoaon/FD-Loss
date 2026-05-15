@@ -47,6 +47,7 @@ class TimmReprModel(torch.nn.Module):
         self.num_prefix_tokens = getattr(self.model, "num_prefix_tokens", 0)
         self.has_attn_pool = hasattr(self.model, "attn_pool") and self.model.attn_pool is not None
         self.feat_dim = self.model.num_features
+        self.gan_dense_ndim = 3 if hasattr(self.model, "patch_embed") else 4
 
         data_cfg = resolve_data_config(self.model.pretrained_cfg)
         native_size = data_cfg["input_size"][-1]  # (C, H, W) -> W
@@ -88,6 +89,16 @@ class TimmReprModel(torch.nn.Module):
         else:
             cls_token = mean_token
         return cls_token, mean_token
+
+    def forward_dense(self, x: torch.Tensor):
+        """Return dense frozen features for GAN heads.
+
+        Shapes:
+            ViT models: [B, N + P, C]
+            CNN models: [B, C, H, W]
+        """
+        x = _preprocess(x, self.mean, self.std, self.target_size)
+        return self.model.forward_features(x)
 
 
 def load_repr_model(name: str, device="cuda", target_size: int | None = None):

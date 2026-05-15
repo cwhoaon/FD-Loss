@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Table 2: JiT-L multi-step to one-step repurposing.
+# JiT-B FD-loss fine-tuning with auxiliary one-step flow-matching loss.
 
 set -euo pipefail
 
@@ -14,6 +14,10 @@ set -euo pipefail
 : "${GLOBAL_BSZ:=1024}"
 : "${ENABLE_WANDB:=1}"
 : "${WANDB_SAMPLE_EVERY:=2000}"
+: "${FD_FLOW_MATCHING_LOSS_WEIGHT:=0.01}"
+: "${FD_FLOW_MATCHING_BATCH_SIZE:=64}"
+: "${FD_FLOW_MATCHING_SAMPLE_WEIGHT_MODE:=pred_x0_l2_exp}"
+: "${FD_FLOW_MATCHING_SAMPLE_WEIGHT_TEMPERATURE:=10}"
 
 
 mkdir -p .cache/torchinductor .cache/triton .cache/tmp
@@ -34,6 +38,15 @@ fi
 LOAD_FROM="${CKPT_ROOT}/JiT-B.pth"
 if [ -n "$CKPT_PATH" ]; then
     LOAD_FROM="$CKPT_PATH"
+fi
+
+FM_ARGS=(
+    --fd_flow_matching_loss_weight "$FD_FLOW_MATCHING_LOSS_WEIGHT"
+    --fd_flow_matching_sample_weight_mode "$FD_FLOW_MATCHING_SAMPLE_WEIGHT_MODE"
+    --fd_flow_matching_sample_weight_temperature "$FD_FLOW_MATCHING_SAMPLE_WEIGHT_TEMPERATURE"
+)
+if [ -n "$FD_FLOW_MATCHING_BATCH_SIZE" ]; then
+    FM_ARGS+=(--fd_flow_matching_batch_size "$FD_FLOW_MATCHING_BATCH_SIZE")
 fi
 
 MAE="vit_large_patch16_224.mae"
@@ -65,11 +78,11 @@ run_one() {
         --epochs 50 --steps_per_epoch 1250 --warmup_epochs 5 \
         --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
         --fd_eigvalsh --fd_ema_beta 0.999 \
-        --compile --auto_resume "$WANDB_FLAG" \
+        --auto_resume "${FM_ARGS[@]}" "$WANDB_FLAG" \
         "$@"
 }
 
-run_one JiT-fd-sim-ep80 \
+run_one "JiT-fd-sim-fm${FD_FLOW_MATCHING_LOSS_WEIGHT}-tau${FD_FLOW_MATCHING_SAMPLE_WEIGHT_TEMPERATURE}-ep80" \
     --fd_repr_models "$SIGLIP" "$MAE" inception \
     --fd_repr_pool_types cls cls cls \
     --fd_target_sizes 224 224 256

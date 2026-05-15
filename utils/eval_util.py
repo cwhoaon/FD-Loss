@@ -8,6 +8,8 @@ import time
 import numpy as np
 import torch
 import torch.distributed
+import torchvision
+import wandb
 
 import utils.distributed_util as dist
 from utils.ema_util import EMAModel
@@ -21,6 +23,15 @@ from utils.logging_util import WandbLogger
 from utils.sampling_util import generate_images
 
 logger = logging.getLogger("FD_loss")
+
+_WANDB_SAMPLE_CLASSES = (
+    0, 8, 22, 33, 65,
+    88, 130, 207, 233, 281,
+    309, 340, 360, 387, 417,
+    470, 537, 579, 654, 701,
+    751, 817, 850, 954, 974,
+)
+_WANDB_SAMPLE_SEED = 12345
 
 
 # =============================================================================
@@ -54,6 +65,93 @@ def _prepare_eval_classes(args, num_images, start_idx, end_idx) -> np.ndarray:
     num_repeats = (num_images + num_classes - 1) // num_classes
     all_classes = np.array((all_classes * num_repeats)[:num_images], dtype=np.int64)
     return all_classes[start_idx:end_idx]
+
+
+def _make_wandb_sample_grid(
+    args: argparse.Namespace,
+    model: torch.nn.Module,
+    tokenizer: torch.nn.Module | None,
+    *,
+    cfg: float,
+    ema_label: str,
+    step: int,
+) -> wandb.Image:
+    """Generate a fixed 25-class, 5x5 sample grid for wandb logging."""
+    if args.num_classes <= max(_WANDB_SAMPLE_CLASSES):
+        raise ValueError(
+            f"wandb eval sample classes require num_classes > {max(_WANDB_SAMPLE_CLASSES)}, "
+            f"got {args.num_classes}"
+        )
+    if len(_WANDB_SAMPLE_CLASSES) != 25 or len(set(_WANDB_SAMPLE_CLASSES)) != 25:
+        raise ValueError("wandb eval sample classes must contain 25 unique class ids")
+
+    device = torch.device("cuda")
+    labels = torch.tensor(_WANDB_SAMPLE_CLASSES, dtype=torch.long, device=device)
+
+    # Keep the monitor grid comparable across eval steps and EMA labels.
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()], enabled=True):
+        torch.manual_seed(_WANDB_SAMPLE_SEED)
+        torch.cuda.manual_seed_all(_WANDB_SAMPLE_SEED)
+        images = generate_images(args, model, labels=labels, cfg=cfg, tokenizer=tokenizer)
+
+    if images.shape[0] != 25:
+        raise RuntimeError(f"expected 25 eval sample images, got shape={tuple(images.shape)}")
+
+    grid = torchvision.utils.make_grid(
+        images.detach().cpu(), nrow=5, padding=2, pad_value=1.0,
+    )
+    grid_np = (
+        grid.mul(255.0)
+        .round()
+        .clamp(0, 255)
+        .to(dtype=torch.uint8)
+        .permute(1, 2, 0)
+        .numpy()
+    )
+    caption = (
+        f"step={step}, ema={ema_label}, cfg={cfg}, "
+        f"classes={list(_WANDB_SAMPLE_CLASSES)}"
+    )
+    return wandb.Image(grid_np, caption=caption)
+
+
+@torch.inference_mode()
+def log_wandb_sample_grids(
+    args: argparse.Namespace,
+    model: torch.nn.Module,
+    ema_model: EMAModel,
+    tokenizer: torch.nn.Module | None,
+    *,
+    step: int,
+    wandb_logger: WandbLogger | None,
+    cfg: float,
+    ema_labels: list[str] | None = None,
+) -> None:
+    """Log fixed 25-class sample grids to wandb, independent of metric eval."""
+    if dist.is_enabled():
+        should_log = dist.broadcast_bool(wandb_logger is not None)
+    else:
+        should_log = wandb_logger is not None
+    if not should_log:
+        return
+
+    if dist.get_global_rank() == 0:
+        was_training = model.training
+        model.eval()
+        log_dict: dict = {}
+        for ema_label in ["online"] + list(ema_labels or ema_model.labels):
+            tag = ema_label if ema_label == "online" else f"ema_{ema_label}"
+            with ema_model.swap(model, label=ema_label):
+                log_dict[f"online_eval/samples-{tag}"] = _make_wandb_sample_grid(
+                    args, model, tokenizer, cfg=cfg, ema_label=ema_label, step=step,
+                )
+        wandb_logger.update(log_dict, step=step)
+        logger.info(f"Fixed eval sample grids logged to wandb at step={step}")
+        if was_training:
+            model.train()
+
+    if dist.is_enabled():
+        torch.distributed.barrier()
 
 
 # =============================================================================
@@ -351,5 +449,9 @@ def evaluate_all_emas(
         log_dict["online_eval/num_images"] = num_images
         wandb_logger.update(log_dict, step=step)
         logger.info(f"Online eval logged to wandb at step={step}")
+    log_wandb_sample_grids(
+        args, model, ema_model, tokenizer, step=step,
+        wandb_logger=wandb_logger, cfg=cfg, ema_labels=ema_labels,
+    )
     logger.info(f"Evaluation done. See {csv_path} for details.")
     return results

@@ -224,6 +224,15 @@ class InceptionV3(nn.Module):
     def forward(self, x):
         # normalize=True:  x in [0, 255] (uint8 range) -> [-1, 1]
         # normalize=False: x in [0, 1] -> [-1, 1]
+        x = self.forward_spatial(x)
+        x = self.AvgPool(x)
+        pool = torch.flatten(x, 1).float()                  # (N, 2048)
+        logits_unbiased = pool.mm(self.fc.weight.T).float()  # (N, 1008)
+        return pool, logits_unbiased
+
+    def forward_spatial(self, x):
+        # Returns the final convolutional feature map before AvgPool.
+        # Input convention matches forward().
         x = x.float()
         x = resize_tf(x, (299, 299))
         if self.normalize:
@@ -249,10 +258,7 @@ class InceptionV3(nn.Module):
         x = self.Mixed_7a(x)
         x = self.Mixed_7b(x)
         x = self.Mixed_7c(x)
-        x = self.AvgPool(x)
-        pool = torch.flatten(x, 1).float()                  # (N, 2048)
-        logits_unbiased = pool.mm(self.fc.weight.T).float()  # (N, 1008)
-        return pool, logits_unbiased
+        return x
 
 
 def load_inception(device="cuda", normalize=True):
@@ -400,4 +406,3 @@ class ConvNextFeatureExtractor(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.layernorm(self.avgpool(self.features(x)))
-

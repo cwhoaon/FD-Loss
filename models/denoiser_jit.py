@@ -115,13 +115,21 @@ class JiTDenoiser(nn.Module):
         if sampling_args is None:
             sampling_args = {}
         num_steps = sampling_args.get("num_steps", 1)
+        cfg = sampling_args.get("cfg", 1.0)
+        cfg_interval = None
+        if "t_min" in sampling_args and "t_max" in sampling_args:
+            cfg_interval = [
+                self._backbone_t(sampling_args["t_min"]),
+                self._backbone_t(sampling_args["t_max"]),
+            ]
+            cfg_interval[0], cfg_interval[1] = min(cfg_interval[0], cfg_interval[1]), max(cfg_interval[0], cfg_interval[1])
 
         t_steps = torch.linspace(1.0, 0.0, num_steps + 1, device=device)
         for i in range(num_steps):
             t_cur = t_steps[i].expand(bsz)
             h_t = (t_cur - t_steps[i + 1]).expand(bsz).view(-1, 1, 1, 1)
             t_cur = t_cur.view(-1, 1, 1, 1)
-            u = self._forward_with_cfg(x, t_cur, y, cfg=1.0)
+            u = self._forward_with_cfg(x, t_cur, y, cfg=cfg, cfg_interval=cfg_interval)
             x = x - h_t * u
         return x
 
