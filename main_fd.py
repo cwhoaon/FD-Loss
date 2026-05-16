@@ -413,12 +413,13 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None,
     if args.compile and real_image_iter is not None:
         logger.warning("[Compilation] --compile is disabled because the train step reads a DataLoader")
     elif args.compile:
-        from utils.runtime_util import _warmup
         logger.info("[Compilation] Compiling fd_train_step ...")
         t0 = time.perf_counter()
         fd_train_step = torch.compile(fd_train_step)
-        _warmup(lambda: fd_train_step(), n=2)
-        logger.info(f"[Compilation] fd_train_step compiled in {time.perf_counter() - t0:.2f}s")
+        logger.info(
+            f"[Compilation] fd_train_step wrapped in {time.perf_counter() - t0:.2f}s; "
+            "first real step will trigger compilation"
+        )
 
     return fd_train_step
 
@@ -439,6 +440,12 @@ def train_and_evaluate(args):
 
     extra = ckpt_resume(args, model_wo_ddp, optimizer, ema_model,
                         extra_keys=["fd_queue_states", "gan_head_states", "gan_optimizer"])
+    if args.current_step >= args.total_steps:
+        logger.info(
+            f"current_step={args.current_step} >= total_steps={args.total_steps}; "
+            "checkpoint is already complete, exiting without another optimizer step"
+        )
+        return 0
 
     rng = RNGStateManager()
     rng.save()
@@ -564,7 +571,7 @@ def train_and_evaluate(args):
     sampling_args = {
         "t_min": args.interval_min,
         "t_max": args.interval_max,
-        "cfg": args.cfg,
+        "cfg": args.fd_sampling_cfg,
         "num_steps": args.num_sampling_steps,
     }
     fd_train_step = get_fd_train_step(
@@ -878,6 +885,9 @@ def get_args_parser():
     parser.add_argument("--fd_ema_beta", type=float, default=0.0, metavar="BETA",
                         help="EMA decay for FD stats (0=disabled, use queue). "
                              "Implies online_accum. E.g. 0.999 → ~1000-batch window")
+    parser.add_argument("--fd_sampling_cfg", type=float, default=1.0,
+                        help="CFG scale used by differentiable samples inside FD/GAN/FM training loss; "
+                             "default 1.0 preserves the original JiT FD-loss training path")
     parser.add_argument("--fd_flow_matching_loss_weight", type=float, default=0.0,
                         help="add weighted one-step t=0 flow-matching loss on random real/noise couplings")
     parser.add_argument("--fd_flow_matching_batch_size", type=int, default=None,

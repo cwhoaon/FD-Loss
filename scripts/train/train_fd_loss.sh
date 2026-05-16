@@ -5,7 +5,7 @@ set -euo pipefail
 
 : "${DATA_ROOT:=./datasets/ImageNet}"
 : "${CKPT_ROOT:=./checkpoints/base}"
-: "${CKPT_PATH:=./checkpoints/trained/checkpoint-80.pth}"
+: "${CKPT_PATH:=}"
 : "${NNODES:=1}"
 : "${NODE_RANK:=0}"
 : "${MASTER_ADDR:=127.0.0.1}"
@@ -65,11 +65,11 @@ run_one() {
         --epochs 50 --steps_per_epoch 1250 --warmup_epochs 5 \
         --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
         --fd_eigvalsh --fd_ema_beta 0.999 \
-        --compile --auto_resume "$WANDB_FLAG" \
+        --compile "$WANDB_FLAG" \
         "$@"
 }
 
-run_one JiT-fd-sim-ep80 \
+run_one JiT-fd-sim \
     --fd_repr_models "$SIGLIP" "$MAE" inception \
     --fd_repr_pool_types cls cls cls \
     --fd_target_sizes 224 224 256

@@ -9,6 +9,7 @@ def adjust_learning_rate(optimizer, step, args):
             lr = args.lr
         elif args.lr_sched == "cosine":
             progress = (step - args.warmup_steps) / (args.total_steps - args.warmup_steps)
+            progress = min(max(progress, 0.0), 1.0)
             lr = args.min_lr + (args.lr - args.min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
         else:
             raise NotImplementedError

@@ -20,7 +20,7 @@ set -euo pipefail
 : "${FD_GAN_BETA2:=0.99}"
 : "${FD_GAN_WEIGHT_DECAY:=0.0}"
 : "${FD_GAN_HEAD_TYPE:=patch}"
-: "${FD_GAN_HIDDEN_DIM:=512}"
+: "${FD_GAN_HIDDEN_DIM:=1024}"
 : "${FD_GAN_REAL_BATCH_SIZE:=64}"
 : "${FD_GAN_D_UPDATES:=1}"
 : "${FD_GAN_DISC_START_STEP:=2000}"
