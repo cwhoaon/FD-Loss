@@ -55,7 +55,7 @@ run_one() {
         --data_path "$DATA_ROOT" \
         --load_from "$LOAD_FROM" \
         --model JiT_B --rope_2d --learned_pe --legacy_time_convention \
-        --cfg 2.4 --interval_min 0.1 --interval_max 1.0 \
+        --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
         --ema_type edm \
         --num_sampling_steps 1 \
         --eval_bsz 256 --num_images_for_eval_and_search 50000 \
@@ -65,7 +65,7 @@ run_one() {
         --epochs 50 --steps_per_epoch 1250 --warmup_epochs 5 \
         --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
         --fd_eigvalsh --fd_ema_beta 0.999 \
-        --compile "$WANDB_FLAG" \
+        "$WANDB_FLAG" \
         "$@"
 }
 

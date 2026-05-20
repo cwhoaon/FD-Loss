@@ -11,10 +11,10 @@ set -euo pipefail
 : "${MASTER_ADDR:=127.0.0.1}"
 : "${MASTER_PORT:=29500}"
 : "${GPUS_PER_NODE:=8}"
-: "${GLOBAL_BSZ:=512}"
+: "${GLOBAL_BSZ:=1024}"
 : "${ENABLE_WANDB:=1}"
 : "${WANDB_SAMPLE_EVERY:=2000}"
-: "${FD_GAN_LOSS_WEIGHT:=0.2}"
+: "${FD_GAN_LOSS_WEIGHT:=0.05}"
 : "${FD_GAN_DISC_LR:=2e-4}"
 : "${FD_GAN_BETA1:=0.0}"
 : "${FD_GAN_BETA2:=0.99}"
@@ -79,22 +79,21 @@ run_one() {
         --data_path "$DATA_ROOT" \
         --load_from "$LOAD_FROM" \
         --model JiT_B --rope_2d --learned_pe --legacy_time_convention \
-        --cfg 2.4 --interval_min 0.1 --interval_max 1.0 \
+        --cfg 3.0 --interval_min 0.1 --interval_max 1.0 \
         --ema_type edm \
         --num_sampling_steps 1 \
         --eval_bsz 256 --num_images_for_eval_and_search 50000 \
         --vis_freq 50 --online_eval --eval_freq 99 \
         --wandb_sample_every "$WANDB_SAMPLE_EVERY" \
         --print_freq 20 --milestone_interval 10 --save_freq 5 \
-        --epochs 50 --steps_per_epoch 1250 --warmup_epochs 5 \
+        --epochs 500 --steps_per_epoch 1250 --warmup_epochs 5 \
         --lr 1e-5 --lr_sched cosine --min_lr 0.0 \
         --fd_eigvalsh --fd_ema_beta 0.999 \
-        --compile \
         "${GAN_ARGS[@]}" "$WANDB_FLAG" \
         "$@"
 }
 
-run_one "JiT-fd-sim-gan${FD_GAN_LOSS_WEIGHT}" \
+run_one "JiT-fd-sim-gan${FD_GAN_LOSS_WEIGHT}-test2" \
     --fd_repr_models "$SIGLIP" "$MAE" inception \
     --fd_repr_pool_types cls cls cls \
     --fd_target_sizes 224 224 256
