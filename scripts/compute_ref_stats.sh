@@ -6,7 +6,7 @@ set -euo pipefail
 
 : "${DATA_ROOT:?Set DATA_ROOT to the ImageNet root with train/ and val/ subdirectories}"
 : "${GPUS_PER_NODE:=8}"
-: "${MASTER_PORT:=29500}"
+: "${MASTER_PORT:=29501}"
 : "${IMG_SIZE:=256}"
 
 run_stats() {

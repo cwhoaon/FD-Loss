@@ -82,6 +82,70 @@ def _compute_trace_term(
     return torch.diagonal(sigma).sum() + torch.diagonal(sigma_ref).sum() - 2.0 * tr_covmean
 
 
+def _symmetric_matrix_sqrt_and_invsqrt(
+    sigma: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``sigma^{1/2}`` and ``sigma^{-1/2}`` for a symmetric PSD matrix."""
+    sigma = 0.5 * (sigma + sigma.T)
+    eigvals, eigvecs = torch.linalg.eigh(sigma)
+    sqrt_vals = torch.clamp(eigvals, min=0.0).sqrt()
+    invsqrt_vals = torch.clamp(eigvals, min=eps).rsqrt()
+    sigma_sqrt = eigvecs @ torch.diag(sqrt_vals) @ eigvecs.T
+    sigma_invsqrt = eigvecs @ torch.diag(invsqrt_vals) @ eigvecs.T
+    return sigma_sqrt, sigma_invsqrt
+
+
+def compute_frechet_regression_target(
+    feats: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
+    eta: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Detached Gaussian OT regression target for features.
+
+    Shapes:
+        feats: ``[B, D]`` current generated features.
+        mu, mu_ref: ``[D]`` current/reference means.
+        sigma, sigma_ref: ``[D, D]`` current/reference covariances.
+
+    The target is ``z + eta * (T(z) - z)``, where ``T`` is the optimal affine
+    transport map from ``N(mu, sigma)`` to ``N(mu_ref, sigma_ref)``.
+    """
+    if feats.ndim != 2:
+        raise ValueError(f"feats must have shape [B, D], got {tuple(feats.shape)}")
+    batch_size, feat_dim = feats.shape
+    expected_vec = (feat_dim,)
+    expected_mat = (feat_dim, feat_dim)
+    if tuple(mu.shape) != expected_vec or tuple(mu_ref.shape) != expected_vec:
+        raise ValueError("mu and mu_ref must both have shape [D]")
+    if tuple(sigma.shape) != expected_mat or tuple(sigma_ref.shape) != expected_mat:
+        raise ValueError("sigma and sigma_ref must both have shape [D, D]")
+
+    compute_dtype = sigma.dtype
+    feats_d = feats.to(dtype=compute_dtype)
+    mu = mu.to(device=feats.device, dtype=compute_dtype)
+    sigma = sigma.to(device=feats.device, dtype=compute_dtype)
+    mu_ref = mu_ref.to(device=feats.device, dtype=compute_dtype)
+    sigma_ref = sigma_ref.to(device=feats.device, dtype=compute_dtype)
+
+    sigma_sqrt, sigma_invsqrt = _symmetric_matrix_sqrt_and_invsqrt(sigma, eps)
+    inner = sigma_sqrt @ sigma_ref @ sigma_sqrt
+    inner_sqrt, _ = _symmetric_matrix_sqrt_and_invsqrt(inner, eps)
+    transport = sigma_invsqrt @ inner_sqrt @ sigma_invsqrt
+    transport = 0.5 * (transport + transport.T)
+
+    mu_row = mu.view(1, feat_dim).expand(batch_size, feat_dim)
+    mu_ref_row = mu_ref.view(1, feat_dim).expand(batch_size, feat_dim)
+    centered = feats_d - mu_row
+    transported = mu_ref_row + centered @ transport.T
+    target = feats_d + float(eta) * (transported - feats_d)
+    return target.to(dtype=feats.dtype)
+
+
 # =============================================================================
 # Differentiable FID
 # =============================================================================
@@ -127,6 +191,41 @@ def compute_frechet_distance_loss(
         return torch.tensor(1e6, device=device, dtype=torch.float32)
 
     return (mean_term + trace_term).float()
+
+
+def compute_frechet_regression_loss(
+    feats: torch.Tensor,
+    mu: torch.Tensor,
+    sigma: torch.Tensor,
+    mu_ref: torch.Tensor,
+    sigma_ref: torch.Tensor,
+    eta: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Regression-form FD loss with a stop-gradient Gaussian OT target.
+
+    Shapes:
+        feats: ``[B, D]`` generated features carrying gradients.
+        mu, mu_ref: ``[D]`` current/reference means.
+        sigma, sigma_ref: ``[D, D]`` current/reference covariances.
+
+    Forward trace:
+        1. Build ``target = sg(z + eta * (T(z) - z))`` from detached Gaussian
+           statistics, where ``T`` maps the current Gaussian to the reference.
+        2. Minimize ``0.5 * mean(sum((z - target)^2, dim=1))``.
+
+    The matrix square roots use eigendecomposition on symmetrized covariances.
+    Eigenvalues are clamped before inverse square roots to avoid division by
+    zero when the empirical covariance is low-rank.
+    """
+    with torch.no_grad():
+        target = compute_frechet_regression_target(
+            feats.detach(), mu.detach(), sigma.detach(), mu_ref, sigma_ref,
+            eta=eta, eps=eps,
+        )
+
+    diff = feats.float() - target.float()
+    return 0.5 * diff.square().sum(dim=1).mean()
 
 
 # =============================================================================

@@ -3,12 +3,18 @@
 
 set -euo pipefail
 
-: "${DATA_ROOT:?Set DATA_ROOT to the ImageNet root with train/ and val/ subdirectories}"
+mkdir -p .cache/torchinductor .cache/triton .cache/tmp
+
+export TMPDIR="$PWD/.cache/tmp"
+export TORCHINDUCTOR_CACHE_DIR="$PWD/.cache/torchinductor"
+export TRITON_CACHE_DIR="$PWD/.cache/triton"
+
+: "${DATA_ROOT:=data/ImageNet}"
 : "${CKPT_ROOT:=./checkpoints/base}"
 : "${NNODES:=1}"
 : "${NODE_RANK:=0}"
 : "${MASTER_ADDR:=127.0.0.1}"
-: "${MASTER_PORT:=29500}"
+: "${MASTER_PORT:=29501}"
 : "${GPUS_PER_NODE:=8}"
 : "${GLOBAL_BSZ:=1024}"
 : "${ENABLE_WANDB:=0}"

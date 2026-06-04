@@ -19,6 +19,7 @@ from frechet_distance.evaluator import FDEvaluator
 from frechet_distance.queue import FeatureQueue
 from frechet_distance.losses import (
     compute_frechet_distance_loss,
+    compute_frechet_regression_loss,
     diff_all_gather,
     load_mu_and_sigma_reference, precompute_sigma_ref_sqrt,
 )
@@ -50,6 +51,9 @@ logger = logging.getLogger("FD_loss")
 
 def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None):
     fid_norm_eps = args.fd_fid_norm_eps
+    fd_loss_form = args.fd_loss_form
+    fd_regression_eta = args.fd_regression_eta
+    fd_regression_eps = args.fd_regression_eps
     batch_size = args.batch_size
     num_classes = args.num_classes
     input_shape = (args.input_channels, args.input_size, args.input_size)
@@ -74,20 +78,39 @@ def get_fd_train_step(model_wo_ddp, judges, sampling_args, args, tokenizer=None)
 
         for i, judge in enumerate(judges):
             new_feats = all_new_feats[i]
+            q = judge["queue"]
+            regression_mode = fd_loss_form == "regression"
 
             _ns_kwargs = dict(sigma_ref_sqrt=judge.get("sigma_ref_sqrt"))
-            if judge["queue"].online_accum or judge["queue"].ema_stats:
-                mu, sigma = judge["queue"].build_feats_stats(new_feats)
+            stats_feats = new_feats.detach() if regression_mode else new_feats
+            if q.online_accum or q.ema_stats:
+                mu, sigma = q.build_feats_stats(stats_feats)
                 fid = compute_frechet_distance_loss(judge["mu_ref"], judge["sigma_ref"],
                                                     mu=mu, sigma=sigma,
                                                     **_ns_kwargs)
             else:
-                all_feats = judge["queue"].build_feats_snapshot(new_feats)
+                all_feats = q.build_feats_snapshot(stats_feats)
                 fid = compute_frechet_distance_loss(judge["mu_ref"], judge["sigma_ref"],
                                                     all_feats=all_feats,
                                                     **_ns_kwargs)
-            fid_loss = fid / (fid.detach() + fid_norm_eps)
-            loss = loss + judge["weight"] * fid_loss
+                if regression_mode:
+                    n_samples, feat_dim = all_feats.shape
+                    mu = all_feats.mean(dim=0)
+                    mu_row = mu.view(1, feat_dim).expand(n_samples, feat_dim)
+                    feats_c = all_feats - mu_row
+                    sigma = (feats_c.T @ feats_c) / (n_samples - 1)
+
+            if regression_mode:
+                fd_objective = compute_frechet_regression_loss(
+                    new_feats, mu, sigma, judge["mu_ref"], judge["sigma_ref"],
+                    eta=fd_regression_eta, eps=fd_regression_eps,
+                )
+                loss_dict[f"fdreg_{judge['name']}"] = float(fd_objective.detach())
+            else:
+                fd_objective = fid
+
+            fd_loss = fd_objective / (fd_objective.detach() + fid_norm_eps)
+            loss = loss + judge["weight"] * fd_loss
             loss_dict[f"fid_{judge['name']}"] = float(fid.detach())
 
         loss.backward(create_graph=False)
@@ -476,6 +499,12 @@ def get_args_parser():
 
     # FD fine-tuning
     parser.add_argument("--queue_size", type=int, default=50000)
+    parser.add_argument("--fd_loss_form", type=str, default="frechet", choices=["frechet", "regression"],
+                        help="FD training objective: direct differentiable FD or detached OT regression")
+    parser.add_argument("--fd_regression_eta", type=float, default=1.0,
+                        help="step size for regression target z + eta * (T(z) - z)")
+    parser.add_argument("--fd_regression_eps", type=float, default=1e-6,
+                        help="eigenvalue floor for FD regression inverse covariance square root")
     parser.add_argument("--fd_fid_norm_eps", type=float, default=0.01)
     parser.add_argument("--fd_queue_fill_bsz", type=int, default=256)
     parser.add_argument("--fd_repr_models", type=str, nargs="+", default=["inception"],
