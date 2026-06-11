@@ -201,11 +201,14 @@ class WandbLogger:
         log_dict = {k: v.item() if isinstance(v, torch.Tensor) else v
                     for k, v in metrics.items() if v is not None}
         try:
-            wandb.log(log_dict, step=step or self.step)
+            wandb.log(log_dict, step=step if step is not None else self.step)
         except Exception as e:
             logger.error(f"wandb logging failed: {e}")
         if step is not None:
             self.step = step
+
+    def log_image(self, key: str, path: str, step: int | None = None, caption: str | None = None) -> None:
+        self.update({key: wandb.Image(path, caption=caption)}, step=step)
 
     def finish(self) -> None:
         try:

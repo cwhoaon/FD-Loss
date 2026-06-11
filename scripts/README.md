@@ -155,6 +155,16 @@ regenerate ImageNet-derived statistics from your local ImageNet copy:
 DATA_ROOT=/path/to/imagenet GPUS_PER_NODE=8 bash scripts/compute_ref_stats.sh
 ```
 
+For CIFAR-10, compute train-set reference statistics through torchvision:
+
+```bash
+DOWNLOAD_CIFAR10=1 DATA_ROOT=data/cifar10 GPUS_PER_NODE=1 \
+  bash scripts/compute_cifar10_ref_stats.sh
+```
+
+CIFAR-10 stats are written under `data/fid_stats/cifar10/` and are selected by
+passing `--dataset cifar10` to training/evaluation commands.
+
 Common reference-statistics files:
 
 ```text

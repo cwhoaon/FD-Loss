@@ -8,6 +8,7 @@ import time
 import torch
 import torch.distributed
 
+from frechet_distance.datasets import DATASET_CHOICES
 from utils.builders import create_generation_model, create_tokenizer
 from utils.checkpoint_util import AsyncCheckpointSaver, ckpt_resume, save_checkpoint
 from utils.distributed_util import all_reduce_mean, preempt_requested, register_preempt_handler
@@ -156,7 +157,7 @@ def train_and_evaluate(args):
     rng = RNGStateManager()
     rng.save()
     if (not args.disable_vis) or args.vis_only:
-        visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer)
+        visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer, wandb_logger=wandb_logger)
         if args.vis_only:
             return 0
 
@@ -358,7 +359,7 @@ def train_and_evaluate(args):
 
         # visualization
         if args.vis_every > 0 and args.current_step % args.vis_every == 0:
-            visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer)
+            visualize(args, model_wo_ddp, ema_model, args.current_step, rng=rng, tokenizer=tokenizer, wandb_logger=wandb_logger)
             model_wo_ddp.train()
 
         # online evaluation
@@ -400,7 +401,7 @@ def get_args_parser():
 
     # model architecture
     parser.add_argument("--model", default="pMF_B", type=str)
-    parser.add_argument("--img_size", default=256, type=int)
+    parser.add_argument("--img_size", default=None, type=int)
     parser.add_argument("--patch_size", default=16, type=int)
     parser.add_argument("--label_drop_prob", default=0.1, type=float)
     parser.add_argument("--attn_dropout", type=float, default=0.0)
@@ -467,8 +468,9 @@ def get_args_parser():
     parser.add_argument("--vis_steps", default=[1], type=int, nargs="+")
 
     # data
-    parser.add_argument("--data_path", default="./data/imagenet/train", type=str)
-    parser.add_argument("--num_classes", default=1000, type=int)
+    parser.add_argument("--dataset", default="imagenet", choices=DATASET_CHOICES)
+    parser.add_argument("--data_path", default=None, type=str)
+    parser.add_argument("--num_classes", default=None, type=int)
     parser.add_argument("--class_of_interest", default=[207, 360, 387, 974, 88, 979, 417, 279],
                         type=int, nargs="+")
     parser.add_argument("--force_class_of_interest", action="store_true")
@@ -489,7 +491,7 @@ def get_args_parser():
     parser.add_argument("--num_images_for_eval_and_search", default=10000, type=int)
     parser.add_argument("--num_images", default=50000, type=int)
     parser.add_argument("--eval_bsz", type=int, default=64)
-    parser.add_argument("--fid_stats_path", type=str, default="data/fid_stats/guided_diffusion_stats.npz")
+    parser.add_argument("--fid_stats_path", type=str, default=None)
     parser.add_argument("--keep_eval_folder", action="store_true")
 
     parser.add_argument("--save_eval_images", action="store_true")

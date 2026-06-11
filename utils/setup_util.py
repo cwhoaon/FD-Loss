@@ -6,6 +6,7 @@ import os
 
 import torch
 
+from frechet_distance.datasets import apply_dataset_defaults
 from utils.distributed_util import enable_distributed, get_global_rank, get_local_rank, get_world_size
 from utils.logging_util import setup_logging, setup_wandb
 from utils.rng_util import fix_random_seeds
@@ -24,6 +25,7 @@ _TOKENIZER_SPECS = {
 def setup(args: argparse.Namespace):
     """setup distributed training, logging, and experiment configuration."""
     enable_distributed()
+    apply_dataset_defaults(args)
 
     # experiment directories
     if args.exp_name is None:

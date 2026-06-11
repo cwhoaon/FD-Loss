@@ -1,6 +1,7 @@
 """Compute FD reference statistics (mu, sigma) for representation models.
 
-Supports ImageFolder inputs, single or multi-GPU via torchrun.
+Supports ImageNet ImageFolder and torchvision CIFAR-10 inputs, single or
+multi-GPU via torchrun.
 Output: .npz with keys "mu", "sigma" (and "avg_mu", "avg_sigma" for dual-output models).
 
 Usage:
@@ -17,15 +18,18 @@ import time
 import numpy as np
 import torch
 import torch.distributed as dist
-import torchvision.datasets as datasets
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
 logger = logging.getLogger("FD_loss")
 
+from frechet_distance.datasets import (
+    DATASET_CHOICES,
+    apply_dataset_defaults,
+    build_dataloader,
+    build_real_image_dataset,
+    stats_path_for_model,
+)
 from frechet_distance.repr_models import load_repr_model
-from utils.data_util import center_crop_arr
 from utils.distributed_util import enable_distributed, get_global_rank, get_world_size
 
 
@@ -33,18 +37,21 @@ def parse_args():
     p = argparse.ArgumentParser(description="Compute repr-model FID reference stats")
     p.add_argument("--model", type=str, required=True,
                    help="'inception' or timm model name (e.g. 'vit_base_patch14_dinov2.lvd142m')")
-    p.add_argument("--data_path", type=str, default="data/imagenet",
-                   help="ImageNet root dir with a 'train/' subfolder")
+    p.add_argument("--dataset", type=str, default="imagenet", choices=DATASET_CHOICES)
+    p.add_argument("--data_path", type=str, default=None,
+                   help="dataset root; ImageNet expects train/, CIFAR-10 uses torchvision cache root")
+    p.add_argument("--download", action="store_true",
+                   help="download torchvision datasets when supported")
     p.add_argument("--num_images", type=int, default=None,
                    help="optional number of images to use")
-    p.add_argument("--img_size", type=int, default=256,
-                   help="center-crop resolution (default: 256)")
+    p.add_argument("--img_size", type=int, default=None,
+                   help="real image resolution; defaults to 256 for ImageNet and 32 for CIFAR-10")
     p.add_argument("--batch_size", type=int, default=256,
                    help="batch size per GPU (default: 256)")
     p.add_argument("--num_workers", type=int, default=10)
     p.add_argument("--target_size", type=int, default=None,
                    help="override model's native target resolution for preprocessing")
-    p.add_argument("--output_dir", type=str, default="data/fid_stats",
+    p.add_argument("--output_dir", type=str, default=None,
                    help="directory to save the .npz file")
     p.add_argument("--output_name", type=str, default=None,
                    help="override output filename")
@@ -58,22 +65,6 @@ def setup_distributed():
     world_size = get_world_size()
     torch.cuda.set_device(rank % torch.cuda.device_count())
     return rank, world_size
-
-
-def build_dataloader(data_path, img_size, batch_size, num_workers, rank, world_size):
-    """Build dataloader for an ImageFolder dataset."""
-    transform = transforms.Compose([
-        transforms.Lambda(lambda img: center_crop_arr(img, img_size)),
-        transforms.ToTensor(),
-    ])
-
-    dataset = datasets.ImageFolder(os.path.join(data_path, "train"), transform=transform)
-    sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank,
-                                 shuffle=False, drop_last=False) if world_size > 1 else None
-    loader = DataLoader(dataset, batch_size=batch_size, sampler=sampler,
-                        num_workers=num_workers, pin_memory=True,
-                        shuffle=False, drop_last=False)
-    return loader, len(dataset)
 
 
 @torch.inference_mode()
@@ -148,20 +139,28 @@ def main():
     for name in ("httpx", "timm", "huggingface_hub"):
         logging.getLogger(name).setLevel(logging.WARNING)
     args = parse_args()
+    apply_dataset_defaults(args)
     rank, world_size = setup_distributed()
     if rank != 0:
         logger.setLevel(logging.WARNING)
 
-    logger.info(f"Computing stats: model={args.model}, img_size={args.img_size}, gpus={world_size}")
+    logger.info(
+        f"Computing stats: dataset={args.dataset}, model={args.model}, "
+        f"img_size={args.img_size}, gpus={world_size}"
+    )
 
     repr_model, feat_dim, has_logits, target_size = load_repr_model(
         args.model, device="cuda", target_size=args.target_size,
     )
 
-    loader, total_images = build_dataloader(
-        args.data_path, args.img_size, args.batch_size,
-        args.num_workers, rank, world_size,
+    dataset = build_real_image_dataset(
+        args.dataset, args.data_path, "train", args.img_size, download=args.download,
     )
+    loader = build_dataloader(
+        dataset, batch_size=args.batch_size, num_workers=args.num_workers,
+        distributed=world_size > 1,
+    )
+    total_images = len(dataset)
 
     if args.num_images is not None:
         total_images = min(total_images, args.num_images)
@@ -184,10 +183,9 @@ def main():
         if args.output_name:
             fname = args.output_name
         else:
-            safe_name = args.model.replace("/", "_").replace(".", "_")
-            if safe_name == "inception":
-                target_size = 256
-            fname = f"{safe_name}_in{args.img_size}_t{target_size}_stats.npz"
+            fname = os.path.basename(
+                stats_path_for_model(args.model, args.img_size, target_size, args.dataset)
+            )
         out_path = os.path.join(args.output_dir, fname)
 
         save_dict = {"mu": cls_mu, "sigma": cls_sigma}

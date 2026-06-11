@@ -1,8 +1,6 @@
 import numpy as np
 import torch
 from PIL import Image
-import cv2
-
 # =============================================================================
 # Image Helpers
 # =============================================================================
@@ -22,6 +20,8 @@ def to_uint8_numpy(tensor: torch.Tensor) -> np.ndarray:
 
 def save_image(img: np.ndarray, path: str, backend: str = "cv2"):
     if backend == "cv2":
+        import cv2
+
         cv2.imwrite(path, img[:, :, ::-1])  # convert RGB -> BGR for opencv
     else:
         Image.fromarray(img).save(path)

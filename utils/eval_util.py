@@ -45,7 +45,10 @@ def get_start_end_indices(total_samples, num_processes, rank):
 
 
 def _prepare_eval_classes(args, num_images, start_idx, end_idx) -> np.ndarray:
-    if args.force_class_of_interest:
+    if getattr(args, "dataset", "imagenet") == "cifar10":
+        all_classes = list(range(args.num_classes))
+        num_classes = args.num_classes
+    elif args.force_class_of_interest:
         all_classes = args.class_of_interest
         num_classes = len(all_classes)
     else:

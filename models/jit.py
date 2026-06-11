@@ -291,6 +291,9 @@ class JiT(nn.Module):
         x = x[:, self.in_context_len:]
         return self.unpatchify(self.final_layer(x, c), self.patch_size)
 
+def JiT_S_4(**kwargs):
+    return JiT(depth=12, hidden_size=384, num_heads=6,
+               bottleneck_dim=128, in_context_len=32, in_context_start=4, patch_size=4, **kwargs)
 
 def JiT_B(**kwargs):
     return JiT(depth=12, hidden_size=768, num_heads=12,
@@ -308,6 +311,7 @@ def JiT_H(**kwargs):
 
 
 JiT_models = {
+    'JiT-S': JiT_S_4,
     'JiT-B': JiT_B,
     'JiT-L': JiT_L,
     'JiT-H': JiT_H,

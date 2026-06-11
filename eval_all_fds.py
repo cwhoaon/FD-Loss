@@ -33,12 +33,20 @@ import time
 import numpy as np
 import torch
 import torch.distributed as dist
-
+from torch.utils.data import Subset
 
 from tqdm import tqdm
 
 from frechet_distance.metrics import compute_fid as np_fid, compute_isc as np_isc
-from frechet_distance.datasets import ImageFolderDataset, ImageListDataset, build_dataloader
+from frechet_distance.datasets import (
+    DATASET_CHOICES,
+    ImageFolderDataset,
+    ImageListDataset,
+    build_dataloader,
+    build_real_image_dataset,
+    dataset_defaults,
+    stats_path_for_model,
+)
 from frechet_distance.repr_models import load_repr_model, model_short_name
 from utils.distributed_util import (
     broadcast_scalar, get_global_rank, get_world_size, is_enabled,
@@ -57,6 +65,7 @@ INCEPTION_STATS = [
     ("FID(JiT)",     "data/fid_stats/jit_in256_stats.npz"),
     ("FID(ADM)",     "data/fid_stats/guided_diffusion_stats.npz"),
 ]
+CIFAR10_INCEPTION_LABEL = "FID(CIFAR10)"
 
 TARGET_SIZE = 256
 
@@ -431,7 +440,10 @@ def _evaluate_from_folder(repr_models, image_dir=None, *,
     t0 = time.perf_counter()
     pbar = tqdm(loader, desc="  Extracting features", disable=(rank != 0))
     for batch in pbar:
-        images = batch.to(device)  # already [0, 1] from ImageFolderDataset
+        # ImageFolderDataset returns a tensor batch [B, 3, H, W]; torchvision CIFAR-10
+        # returns (images [B, 3, H, W], labels [B]). Only images enter FD metrics.
+        images = batch[0] if isinstance(batch, (tuple, list)) else batch
+        images = images.to(device)  # already [0, 1] from the dataset transform
         accumulate_batch(images, repr_models, accumulators, inception_logits,
                           local_feat_lists)
         count += images.shape[0]
@@ -465,7 +477,7 @@ def _evaluate_from_folder(repr_models, image_dir=None, *,
 # ---------------------------------------------------------------------------
 
 def _load_repr_models(model_names, img_size, target_size=TARGET_SIZE,
-                      target_size_overrides=None):
+                      target_size_overrides=None, dataset="imagenet"):
     """Load repr models and reference stats. Returns list of repr-entry dicts."""
     rank = get_global_rank()
     target_size_overrides = target_size_overrides or {}
@@ -479,8 +491,15 @@ def _load_repr_models(model_names, img_size, target_size=TARGET_SIZE,
         )
 
         if name == "inception":
-            # Inception uses multiple reference datasets with custom labels
-            for label, stats_path in INCEPTION_STATS:
+            if dataset == "cifar10":
+                inception_stats = [(
+                    CIFAR10_INCEPTION_LABEL,
+                    stats_path_for_model(name, img_size, ts, dataset=dataset),
+                )]
+            else:
+                # ImageNet Inception uses multiple reference datasets with custom labels.
+                inception_stats = INCEPTION_STATS
+            for label, stats_path in inception_stats:
                 if not os.path.exists(stats_path):
                     logger.warning(f"  Skipping {label}: {stats_path} not found")
                     continue
@@ -494,12 +513,7 @@ def _load_repr_models(model_names, img_size, target_size=TARGET_SIZE,
                 })
                 logger.info(f"  '{label}': feat_dim={feat_dim}")
         else:
-            stats_name = name
-            safe_name = stats_name.replace("/", "_").replace(".", "_")
-            if img_size == 512:
-                img_size = 256
-                
-            stats_path = f"data/fid_stats/{safe_name}_in{img_size}_t{ts}_stats.npz"
+            stats_path = stats_path_for_model(name, img_size, ts, dataset=dataset)
             short = model_short_name(name)
             # if not os.path.exists(stats_path):
             ref = np.load(stats_path)
@@ -536,7 +550,7 @@ def _load_prc_refs(prc_model_names, repr_models, prc_ref_dir):
     for prc_raw in prc_model_names:
         short = model_short_name(prc_raw)
         if prc_raw == "inception":
-            inception_labels = {label for label, _ in INCEPTION_STATS}
+            inception_labels = {label for label, _ in INCEPTION_STATS} | {CIFAR10_INCEPTION_LABEL}
             match = next((entry for entry in repr_models
                           if entry["name"] in inception_labels), None)
             if match is None:
@@ -660,7 +674,7 @@ def _compute_fdr6(results):
 def _resolve_prc(results, is_val, prc_results, mmd_results=None):
     """Resolve per-row derived metrics (inception rows share IS/P&R/CMMD)."""
     mmd_results = mmd_results or {}
-    inception_labels = {label for label, _ in INCEPTION_STATS}
+    inception_labels = {label for label, _ in INCEPTION_STATS} | {CIFAR10_INCEPTION_LABEL}
     inception_prc = next(((p, r) for name, (p, r) in prc_results.items()
                           if name in inception_labels), (None, None))
     inception_mmd = next((v for name, v in mmd_results.items()
@@ -805,8 +819,12 @@ def main_folder(args):
         "must have the same number of entries"
     )
 
-    repr_models = _load_repr_models(args.models, args.img_size,
-                                     target_size_overrides=DEFAULT_TARGET_SIZES)
+    if args.img_size is None:
+        args.img_size = dataset_defaults(args.dataset)["img_size"]
+    repr_models = _load_repr_models(
+        args.models, args.img_size,
+        target_size_overrides=DEFAULT_TARGET_SIZES, dataset=args.dataset,
+    )
 
     eval_prc = not args.no_prc
     eval_mmd = getattr(args, "eval_mmd", False)
@@ -869,16 +887,27 @@ def main_random_train(args):
     if rank != 0:
         logger.setLevel(logging.WARNING)
 
-    # Load training image list
-    train_list_path = args.train_list
-    data_root = args.data_root
-    with open(train_list_path) as f:
-        lines = [l.strip().split()[0] for l in f if l.strip()]
-    all_paths = [os.path.join(data_root, "train", p) for p in lines]
-    logger.info(f"Training set: {len(all_paths)} images")
+    defaults = dataset_defaults(args.dataset)
+    if args.img_size is None:
+        args.img_size = defaults["img_size"]
+    data_root = args.data_root or defaults["data_path"]
 
-    repr_models = _load_repr_models(args.models, args.img_size,
-                                     target_size_overrides=DEFAULT_TARGET_SIZES)
+    if args.dataset == "cifar10":
+        train_dataset = build_real_image_dataset(
+            "cifar10", data_root, "train", args.img_size, download=False,
+        )
+        logger.info(f"CIFAR-10 training set: {len(train_dataset)} images")
+    else:
+        train_list_path = args.train_list
+        with open(train_list_path) as f:
+            lines = [l.strip().split()[0] for l in f if l.strip()]
+        all_paths = [os.path.join(data_root, "train", p) for p in lines]
+        logger.info(f"Training set: {len(all_paths)} images")
+        train_dataset = None
+    repr_models = _load_repr_models(
+        args.models, args.img_size,
+        target_size_overrides=DEFAULT_TARGET_SIZES, dataset=args.dataset,
+    )
 
     eval_prc = not args.no_prc
     eval_mmd = getattr(args, "eval_mmd", False)
@@ -903,8 +932,12 @@ def main_random_train(args):
         logger.info(f"{'='*60}")
 
         rng = random.Random(seed)
-        sampled = rng.sample(all_paths, num_samples)
-        dataset = ImageListDataset(sampled, img_size=args.img_size)
+        if args.dataset == "cifar10":
+            sampled = rng.sample(range(len(train_dataset)), num_samples)
+            dataset = Subset(train_dataset, sampled)
+        else:
+            sampled = rng.sample(all_paths, num_samples)
+            dataset = ImageListDataset(sampled, img_size=args.img_size)
 
         results, is_val, elapsed, num_images, prc_results, mmd_results = _evaluate_from_folder(
             repr_models, dataset=dataset,
@@ -1036,8 +1069,10 @@ def main_generate(args):
         if args.vis_only:
             exit()
 
-    repr_models = _load_repr_models(args.models, args.img_size,
-                                     target_size_overrides=DEFAULT_TARGET_SIZES)
+    repr_models = _load_repr_models(
+        args.models, args.img_size,
+        target_size_overrides=DEFAULT_TARGET_SIZES, dataset=args.dataset,
+    )
 
     eval_prc = not args.no_prc
     eval_mmd = getattr(args, "eval_mmd", False)
@@ -1140,12 +1175,13 @@ def _get_folder_parser():
                         help="One or more image folders to evaluate")
     parser.add_argument("--eval_random_train_set", action="store_true",
                         help="Sample random subsets from training set and evaluate")
+    parser.add_argument("--dataset", default="imagenet", choices=DATASET_CHOICES)
     parser.add_argument("--train_list", type=str, default="data/train.txt")
-    parser.add_argument("--data_root", type=str, default="data/imagenet")
+    parser.add_argument("--data_root", type=str, default=None)
     parser.add_argument("--num_samples", type=int, default=50000)
     parser.add_argument("--num_trials", type=int, default=5)
     parser.add_argument("--models", type=str, nargs="+", default=DEFAULT_MODELS)
-    parser.add_argument("--img_size", type=int, default=256)
+    parser.add_argument("--img_size", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--no_prc", action="store_true")

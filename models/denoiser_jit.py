@@ -169,6 +169,7 @@ JiTDenoiser_models = {
     "JiTDenoiser_base": lambda **kw: JiTDenoiser(model_size="base", **kw),
     "JiTDenoiser_large": lambda **kw: JiTDenoiser(model_size="large", **kw),
     "JiTDenoiser_huge": lambda **kw: JiTDenoiser(model_size="huge", **kw),
+    "JiT_S": lambda **kw: JiTDenoiser(model_size="small", **kw),
     "JiT_B": lambda **kw: JiTDenoiser(model_size="base", **kw),
     "JiT_L": lambda **kw: JiTDenoiser(model_size="large", **kw),
     "JiT_H": lambda **kw: JiTDenoiser(model_size="huge", **kw),

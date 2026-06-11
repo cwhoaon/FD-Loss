@@ -31,12 +31,16 @@ statistics utilities, and scripts for the ImageNet experiments.
 
 ### Dataset
 
-Download ImageNet and place it in your `DATA_ROOT` using the standard
-`ImageFolder` layout:
+ImageNet experiments expect `DATA_ROOT` to use the standard `ImageFolder` layout:
 
 ```bash
 export DATA_ROOT=/path/to/imagenet
 ```
+
+CIFAR-10 is loaded through `torchvision.datasets.CIFAR10` with `--dataset cifar10`.
+Generated/model tensors stay at 32px; frozen representation models resize inputs
+internally before feature extraction. Use `DOWNLOAD_CIFAR10=1` when computing
+reference statistics for the first time.
 
 ### Installation
 

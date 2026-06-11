@@ -47,3 +47,5 @@ dist/
 !data/**/.gitkeep
 data/ImageNet
 .cache/
+data/cifar10
+custom_checkpoints/

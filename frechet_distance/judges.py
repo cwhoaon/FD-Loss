@@ -13,6 +13,7 @@ from frechet_distance.losses import (
     compute_frechet_distance_loss,
     diff_all_gather,
 )
+from frechet_distance.datasets import stats_path_for_model
 from frechet_distance.metrics import compute_fid as np_fid
 from utils.distributed_util import is_main_process
 
@@ -23,14 +24,12 @@ logger = logging.getLogger("FD_loss")
 # Helpers
 # ---------------------------------------------------------------------------
 
-def infer_stats_path(name, img_size, target_size, default_inception_path=None):
+def infer_stats_path(name, img_size, target_size, default_inception_path=None, dataset="imagenet"):
     """Auto-infer reference stats path for a repr model."""
-    if name == "inception" and default_inception_path is not None:
-        return default_inception_path
-    sanitized = name.replace(".", "_")
-    if img_size == 512: # TODO
-        img_size = 256
-    return f"data/fid_stats/{sanitized}_in{img_size}_t{target_size}_stats.npz"
+    return stats_path_for_model(
+        name, img_size, target_size, dataset=dataset,
+        default_inception_path=default_inception_path,
+    )
 
 
 def extract_judge_features(judge, images):
@@ -57,7 +56,10 @@ def resolve_per_model_args(args):
 
     if args.fd_repr_stats_paths is None:
         args.fd_repr_stats_paths = [
-            infer_stats_path(n, args.img_size, ts, args.fid_stats_path)
+            infer_stats_path(
+                n, args.img_size, ts, args.fid_stats_path,
+                dataset=getattr(args, "dataset", "imagenet"),
+            )
             for n, ts in zip(args.fd_repr_models, args.fd_target_sizes)
         ]
     elif len(args.fd_repr_stats_paths) == 1 and num > 1:
